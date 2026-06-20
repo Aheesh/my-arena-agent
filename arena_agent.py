@@ -1,5 +1,8 @@
 import asyncio, json, os, re, uuid
+from pathlib import Path
+
 import httpx
+from dotenv import load_dotenv
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -7,17 +10,28 @@ from google.genai import types as genai_types
 from fastmcp.client import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 # ── Change these three lines ──────────────────────────────
 AGENT_NAME  = "KachuaChap-v1"          # shown on the leaderboard
 LINKEDIN_URL  = os.getenv("LINKEDIN_URL")
 AGENT_STACK = "Python / ADK / Gemini" # describe your stack
-MODEL       = "gemini-2.0-flash"      # or gemini-2.5-pro-preview
+MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # 2.0-flash has 0 free-tier quota
 
 # ── Leave these as-is ─────────────────────────────────────
 MCP_ENDPOINT   = "https://agent-arena-623774504237.asia-southeast1.run.app/mcp"
 ID_TOKEN       = os.getenv("EPHEMERAL_JWT")  #https://agent-arena.dev/ MCP Documentattion tab
 MAX_TURNS      = 20
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not ID_TOKEN:
+    raise SystemExit(
+        "EPHEMERAL_JWT is missing. Add it to .env or export it.\n"
+        "Get a fresh token from https://agent-arena.dev/ (MCP Documentation tab).\n"
+        "Tokens expire after ~1 hour."
+    )
+if not GEMINI_API_KEY:
+    raise SystemExit("GEMINI_API_KEY is missing. Add it to .env or export it.")
 
 # ── Run State ────────────────────────────────────────────
 
@@ -55,6 +69,71 @@ async def mcp_call(tool: str, args: dict, state: RunState) -> str:
         if getattr(b, "text", None)
     )
 
+# Step 6 - Helper Tools
+
+async def web_search(query: str, max_results: int = 5) -> str:
+    """Search the internet for current facts, docs, or recent events.
+    Use before answering any task that needs up-to-date information.
+    Args:
+        query: the search query string
+        max_results: how many results to return (1-10)
+    """
+    max_results = max(1, min(max_results, 10))
+
+    def _ddgs_search():
+        from ddgs import DDGS
+        return list(DDGS().text(query, max_results=max_results))
+
+    try:
+        hits = await asyncio.to_thread(_ddgs_search)
+        if hits:
+            return "\n---\n".join(
+                f"{r.get('title', 'Untitled')}\n{r.get('body', '').strip()}\n{r.get('href', '')}"
+                for r in hits
+            )
+    except Exception as ex:
+        print(f"  [web_search] ddgs failed: {ex}")
+
+    # Fallback: DuckDuckGo instant-answer API (limited but no extra deps)
+    url = "https://api.duckduckgo.com/"
+    params = {"q": query, "format": "json", "no_html": "1"}
+    async with httpx.AsyncClient() as c:
+        r = await c.get(url, params=params, timeout=10)
+        data = r.json()
+    results = []
+    if data.get("AbstractText"):
+        results.append(data["AbstractText"])
+    for t in data.get("RelatedTopics", [])[:max_results]:
+        if "Text" in t:
+            results.append(t["Text"])
+        elif "Topics" in t:
+            for sub in t["Topics"][:max_results - len(results)]:
+                if "Text" in sub:
+                    results.append(sub["Text"])
+    return "\n---\n".join(results) or "No results found."
+
+async def run_code(code: str, timeout: int = 10) -> str:
+    """Execute Python code in a subprocess and return its output.
+    Use to verify algorithm correctness or compute results before submitting.
+    Args:
+        code: valid Python source code
+        timeout: max seconds (default 10)
+    """
+    import sys
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", code,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return f"Timed out after {timeout}s"
+    o = out.decode().strip()
+    e = err.decode().strip()
+    return (f"stdout:\n{o}\nstderr:\n{e}" if e else o) or "(no output)"
+
 # Step 4 - Arena Tools
 
 def make_arena_tools(state: RunState):
@@ -91,34 +170,7 @@ def make_arena_tools(state: RunState):
         return await mcp_call("skip_task",
             {"idToken": ID_TOKEN, "agentId": agent_id, "taskId": task_id}, state)
 
-    return [register_agent, get_tasks, submit_task, skip_task, web_search]
-
-# Step 6 - Helper Tools
-
-async def web_search(query: str, max_results: int = 5) -> str:
-    """Search the internet for current facts, docs, or recent events.
-    Use before answering any task that needs up-to-date information.
-    Args:
-        query: the search query string
-        max_results: how many results to return (1-10)
-    """
-    max_results = max(1, min(max_results, 10))
-    url = "https://api.duckduckgo.com/"
-    params = {"q": query, "format": "json", "no_html": "1"}
-    async with httpx.AsyncClient() as c:
-        r = await c.get(url, params=params, timeout=10)
-        data = r.json()
-    results = []
-    if data.get("AbstractText"):
-        results.append(data["AbstractText"])
-    for t in data.get("RelatedTopics", [])[:max_results]:
-        if "Text" in t:
-            results.append(t["Text"])
-        elif "Topics" in t:
-            for sub in t["Topics"][:max_results - len(results)]:
-                if "Text" in sub:
-                    results.append(sub["Text"])
-    return "\n---\n".join(results) or "No results found."
+    return [register_agent, get_tasks, submit_task, skip_task, web_search, run_code]
 
 SYSTEM_PROMPT = f"""
 You are an autonomous agent competing in the Agent Arena.
@@ -133,8 +185,10 @@ EXACT STEPS TO FOLLOW:
 6. If NO_TASKS in result → you are done, print a summary and stop
 7. Never submit the same task_id twice. Never ask for confirmation.
 
-You also have: web_search.
-Use it proactively — search before answering factual or time-sensitive tasks.
+Helper tools (use exact names): web_search, run_code.
+- web_search(query): search the web for current facts before answering.
+- run_code(code): execute Python to verify logic or compute answers.
+Only call tools that exist above. Never invent tool names.
 """
 
 def build_agent(state: RunState) -> LlmAgent:
@@ -151,23 +205,33 @@ def build_agent(state: RunState) -> LlmAgent:
 
 # Step 5 - Runner Loop -- 
 
-async def run_turn(runner, session_id, message):
+async def run_turn(runner, session_id, message, max_retries=5):
     """Send one message; collect and return the agent's final text reply."""
     content = genai_types.Content(
         role="user",
         parts=[genai_types.Part(text=message)],
     )
-    final = ""
-    async for event in runner.run_async(
-        user_id="arena-user", session_id=session_id, new_message=content
-    ):
-        if not event.content: continue
-        for part in event.content.parts:
-            if getattr(part, "function_call", None):
-                print(f"  → [{part.function_call.name}]")
-            elif getattr(part, "text", None) and event.turn_complete:
-                final = part.text
-    return final
+    for attempt in range(max_retries):
+        try:
+            final = ""
+            async for event in runner.run_async(
+                user_id="arena-user", session_id=session_id, new_message=content
+            ):
+                if not event.content: continue
+                for part in event.content.parts:
+                    if getattr(part, "function_call", None):
+                        print(f"  → [{part.function_call.name}]")
+                    elif getattr(part, "text", None) and event.turn_complete:
+                        final = part.text
+            return final
+        except Exception as ex:
+            err = str(ex)
+            if "429" not in err and "RESOURCE_EXHAUSTED" not in err:
+                raise
+            wait = min(60, 15 * (attempt + 1))
+            print(f"  [rate limit] waiting {wait}s before retry ({attempt + 1}/{max_retries})...")
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"Rate limit exceeded after {max_retries} retries for model {MODEL}")
 
 async def main():
     state = RunState()
