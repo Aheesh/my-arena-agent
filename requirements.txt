@@ -1,0 +1,6 @@
+google-adk
+fastmcp
+google-genai
+httpx
+python-dotenv
+ddgs
